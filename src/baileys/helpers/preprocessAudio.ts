@@ -16,7 +16,7 @@ function bufferToStream(buffer: Buffer) {
 
 export async function preprocessAudio(
   audio: Buffer,
-  format: "mp3-low" | "mp3-high" | "wav",
+  format: "ogg-low" | "mp3-high" | "wav",
 ): Promise<Buffer> {
   const tmpFilename = join(
     tmpdir(),
@@ -28,25 +28,24 @@ export async function preprocessAudio(
     if (format === "wav") {
       command
         .audioCodec("pcm_s16le")
+        .format("wav")
         .audioFrequency(16000)
-        .audioChannels(1)
-        .format("wav");
+        .audioChannels(1);
     }
-    if (format === "mp3-low") {
+    if (format === "ogg-low") {
       command
-        .audioCodec("libmp3lame")
-        .audioFrequency(16000)
-        .audioChannels(1)
+        .audioCodec("libopus")
+        .format("ogg")
         .audioBitrate("48k")
-        .format("mp3");
+        .audioChannels(1);
     }
     if (format === "mp3-high") {
       command
         .audioCodec("libmp3lame")
+        .format("mp3")
         .audioFrequency(44100)
         .audioChannels(2)
-        .audioBitrate("128k")
-        .format("mp3");
+        .audioBitrate("128k");
     }
 
     // NOTE: We need to output to a tmp file due to limitations in ffmpeg outputting to a node stream.
