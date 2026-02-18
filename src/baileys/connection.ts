@@ -9,9 +9,11 @@ import makeWASocket, {
   DisconnectReason,
   type MessageReceiptType,
   makeCacheableSignalKeyStore,
+  type ParticipantAction,
   type proto,
   type UserFacingSocketConfig,
   type WAConnectionState,
+  type WAMessage,
   type WAPresence,
 } from "@whiskeysockets/baileys";
 import { toDataURL } from "qrcode";
@@ -24,6 +26,7 @@ import { useRedisAuthState } from "@/baileys/redisAuthState";
 import type {
   BaileysConnectionOptions,
   BaileysConnectionWebhookPayload,
+  MessageKeyWithId,
 } from "@/baileys/types";
 import config from "@/config";
 import { asyncSleep } from "@/helpers/asyncSleep";
@@ -190,7 +193,13 @@ export class BaileysConnection {
   }
 
   private addEventListeners({ saveCreds }: { saveCreds: () => Promise<void> }) {
-    const handledEvents = {
+    type EventHandlers = {
+      [K in keyof BaileysEventMap]?: (
+        data: BaileysEventMap[K],
+      ) => Promise<void>;
+    };
+
+    const handledEvents: EventHandlers = {
       "creds.update": saveCreds,
       "connection.update": this.withErrorHandling(
         "handleConnectionUpdate",
@@ -211,6 +220,14 @@ export class BaileysConnection {
       "messaging-history.set": this.withErrorHandling(
         "handleMessagingHistorySet",
         this.handleMessagingHistorySet,
+      ),
+      "groups.update": this.withErrorHandling(
+        "handleGroupsUpdate",
+        this.handleGroupsUpdate,
+      ),
+      "group-participants.update": this.withErrorHandling(
+        "handleGroupParticipantsUpdate",
+        this.handleGroupParticipantsUpdate,
       ),
     };
 
@@ -251,7 +268,11 @@ export class BaileysConnection {
     await this.close();
   }
 
-  async sendMessage(jid: string, messageContent: AnyMessageContent) {
+  async sendMessage(
+    jid: string,
+    messageContent: AnyMessageContent,
+    options?: { quoted?: WAMessage },
+  ) {
     this.safeSocket();
 
     let waveformProxy: Buffer | null = null;
@@ -282,6 +303,7 @@ export class BaileysConnection {
 
     return this.safeSocket().sendMessage(jid, messageContent, {
       waveformProxy,
+      quoted: options?.quoted,
     });
   }
 
@@ -332,12 +354,47 @@ export class BaileysConnection {
     return this.safeSocket().sendReceipts(keys, type);
   }
 
+  deleteMessage(jid: string, key: MessageKeyWithId) {
+    return this.safeSocket().sendMessage(jid, { delete: key });
+  }
+
+  editMessage(
+    jid: string,
+    key: proto.IMessageKey,
+    messageContent: AnyMessageContent,
+  ) {
+    return this.safeSocket().sendMessage(jid, {
+      ...messageContent,
+      edit: key,
+    } as AnyMessageContent);
+  }
+
   async profilePictureUrl(jid: string, type?: "preview" | "image") {
     return this.safeSocket().profilePictureUrl(jid, type);
   }
 
   onWhatsApp(jids: string[]) {
     return this.safeSocket().onWhatsApp(...jids);
+  }
+
+  groupMetadata(jid: string) {
+    return this.safeSocket().groupMetadata(jid);
+  }
+
+  groupParticipants(
+    jid: string,
+    participants: string[],
+    action: ParticipantAction,
+  ) {
+    return this.safeSocket().groupParticipantsUpdate(jid, participants, action);
+  }
+
+  groupUpdateSubject(jid: string, subject: string) {
+    return this.safeSocket().groupUpdateSubject(jid, subject);
+  }
+
+  groupUpdateDescription(jid: string, description?: string) {
+    return this.safeSocket().groupUpdateDescription(jid, description);
   }
 
   private safeSocket() {
@@ -480,6 +537,22 @@ export class BaileysConnection {
     this.sendToWebhook({ event: "messaging-history.set", data });
   }
 
+  private handleGroupsUpdate(data: BaileysEventMap["groups.update"]) {
+    this.sendToWebhook({
+      event: "groups.update",
+      data,
+    });
+  }
+
+  private handleGroupParticipantsUpdate(
+    data: BaileysEventMap["group-participants.update"],
+  ) {
+    this.sendToWebhook({
+      event: "group-participants.update",
+      data,
+    });
+  }
+
   private handleWrongPhoneNumber() {
     this.sendToWebhook({
       event: "connection.update",
@@ -546,8 +619,9 @@ export class BaileysConnection {
           return response;
         }
         logger.error(
-          "[%s] [sendToWebhook] [ERROR] payload=%o response=%o",
+          "[%s] [sendToWebhook] [ERROR] webhookUrl=%s payload=%o response=%o",
           this.phoneNumber,
+          this.webhookUrl,
           sanitizedPayload,
           { status: response.status, statusText: response.statusText },
         );
@@ -555,8 +629,9 @@ export class BaileysConnection {
 
       if (error) {
         logger.error(
-          "[%s] [sendToWebhook] [ERROR] payload=%o error=%s",
+          "[%s] [sendToWebhook] [ERROR] webhookUrl=%s payload=%o error=%s",
           this.phoneNumber,
+          this.webhookUrl,
           sanitizedPayload,
           errorToString(error),
         );
@@ -579,8 +654,9 @@ export class BaileysConnection {
     }
 
     logger.error(
-      "[%s] [sendToWebhook] [FAILED] payload=%o",
+      "[%s] [sendToWebhook] [FAILED] webhookUrl=%s payload=%o",
       this.phoneNumber,
+      this.webhookUrl,
       sanitizedPayload,
     );
   }

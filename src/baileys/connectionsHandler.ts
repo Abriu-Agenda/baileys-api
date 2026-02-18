@@ -1,7 +1,9 @@
 import type {
   AnyMessageContent,
   ChatModification,
+  ParticipantAction,
   proto,
+  WAMessage,
   WAPresence,
 } from "@whiskeysockets/baileys";
 import {
@@ -12,6 +14,7 @@ import { getRedisSavedAuthStateIds } from "@/baileys/redisAuthState";
 import type {
   BaileysConnectionOptions,
   FetchMessageHistoryOptions,
+  MessageKeyWithId,
   SendReceiptsOptions,
 } from "@/baileys/types";
 import logger from "@/lib/logger";
@@ -108,12 +111,16 @@ export class BaileysConnectionsHandler {
     {
       jid,
       messageContent,
+      quoted,
     }: {
       jid: string;
       messageContent: AnyMessageContent;
+      quoted?: WAMessage;
     },
   ) {
-    return this.getConnection(phoneNumber).sendMessage(jid, messageContent);
+    return this.getConnection(phoneNumber).sendMessage(jid, messageContent, {
+      quoted,
+    });
   }
 
   readMessages(phoneNumber: string, keys: proto.IMessageKey[]) {
@@ -139,6 +146,32 @@ export class BaileysConnectionsHandler {
     return this.getConnection(phoneNumber).sendReceipts(keys, type);
   }
 
+  deleteMessage(
+    phoneNumber: string,
+    { jid, key }: { jid: string; key: MessageKeyWithId },
+  ) {
+    return this.getConnection(phoneNumber).deleteMessage(jid, key);
+  }
+
+  editMessage(
+    phoneNumber: string,
+    {
+      jid,
+      key,
+      messageContent,
+    }: {
+      jid: string;
+      key: proto.IMessageKey;
+      messageContent: AnyMessageContent;
+    },
+  ) {
+    return this.getConnection(phoneNumber).editMessage(
+      jid,
+      key,
+      messageContent,
+    );
+  }
+
   profilePictureUrl(
     phoneNumber: string,
     jid: string,
@@ -149,6 +182,38 @@ export class BaileysConnectionsHandler {
 
   onWhatsApp(phoneNumber: string, jids: string[]) {
     return this.getConnection(phoneNumber).onWhatsApp(jids);
+  }
+
+  groupMetadata(phoneNumber: string, jid: string) {
+    return this.getConnection(phoneNumber).groupMetadata(jid);
+  }
+
+  groupParticipants(
+    phoneNumber: string,
+    jid: string,
+    participants: string[],
+    action: ParticipantAction,
+  ) {
+    return this.getConnection(phoneNumber).groupParticipants(
+      jid,
+      participants,
+      action,
+    );
+  }
+
+  groupUpdateSubject(phoneNumber: string, jid: string, subject: string) {
+    return this.getConnection(phoneNumber).groupUpdateSubject(jid, subject);
+  }
+
+  groupUpdateDescription(
+    phoneNumber: string,
+    jid: string,
+    description?: string,
+  ) {
+    return this.getConnection(phoneNumber).groupUpdateDescription(
+      jid,
+      description,
+    );
   }
 
   async logout(phoneNumber: string) {
