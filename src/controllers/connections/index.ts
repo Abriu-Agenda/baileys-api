@@ -1,10 +1,14 @@
 import Elysia, { t } from "elysia";
 import baileys from "@/baileys";
-import { BaileysNotConnectedError } from "@/baileys/connection";
+import {
+  BaileysConnectionForbiddenError,
+  BaileysNotConnectedError,
+} from "@/baileys/connection";
 import {
   buildEditableMessageContent,
   buildMessageContent,
 } from "@/controllers/connections/helpers";
+import { withIdempotency } from "@/helpers/withIdempotency";
 import { authMiddleware } from "@/middlewares/auth";
 import {
   anyJid,
@@ -23,16 +27,38 @@ const connectionsController = new Elysia({
   detail: {
     tags: ["Connections"],
     security: [{ xApiKey: [] }],
+    responses: {
+      403: {
+        description:
+          "Forbidden — the API key does not own this connection. Returned when a connection is bound to a different API key.",
+      },
+    },
   },
 })
-  // TODO: Use auth data to limit access to existing connections.
   .use(authMiddleware)
+  .onBeforeHandle(async ({ params, apiKeyHash, set }) => {
+    const phoneNumber = (params as { phoneNumber?: string })?.phoneNumber;
+    if (phoneNumber) {
+      try {
+        await baileys.verifyConnectionAccess(phoneNumber, apiKeyHash);
+      } catch (e) {
+        if (e instanceof BaileysConnectionForbiddenError) {
+          set.status = 403;
+          return { error: "Forbidden", message: e.message };
+        }
+        throw e;
+      }
+    }
+  })
   .post(
     "/:phoneNumber",
-    async ({ params, body }) => {
+    async ({ params, body, apiKeyHash }) => {
       const { phoneNumber } = params;
 
-      await baileys.connect(phoneNumber, body);
+      await baileys.connect(phoneNumber, {
+        ...body,
+        apiKeyHash: apiKeyHash ?? undefined,
+      });
     },
     {
       params: phoneNumberParams,
@@ -64,6 +90,20 @@ const connectionsController = new Elysia({
         syncFullHistory: t.Optional(
           t.Boolean({
             description: "Sync full history of messages on connection.",
+            default: false,
+          }),
+        ),
+        groupsEnabled: t.Optional(
+          t.Boolean({
+            description:
+              "Enable full group message processing. When false, group messages are accumulated and sent as activity summaries.",
+            default: true,
+          }),
+        ),
+        autoPresenceSubscribe: t.Optional(
+          t.Boolean({
+            description:
+              "Automatically subscribe to presence updates when sending/receiving messages or typing status to/from a contact. Subscriptions are ephemeral and re-established automatically.",
             default: false,
           }),
         ),
@@ -115,36 +155,84 @@ const connectionsController = new Elysia({
     },
   )
   .post(
+    "/:phoneNumber/presence-subscribe",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { jids } = body;
+
+      const result = await baileys.presenceSubscribe(phoneNumber, jids);
+      return { data: result };
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        jids: t.Array(
+          anyJid("WhatsApp JID to subscribe to presence updates for"),
+          {
+            description: "Array of JIDs to subscribe to presence updates",
+            minItems: 1,
+            maxItems: 50,
+          },
+        ),
+      }),
+      detail: {
+        description:
+          "Subscribe to presence updates for one or more JIDs. Presence updates will be forwarded via the `presence.update` webhook event. Subscriptions are ephemeral, so re-subscribe periodically for continuous monitoring. LID JIDs are automatically resolved to phone number JIDs before subscribing.",
+        responses: {
+          200: {
+            description: "Presence subscription result",
+          },
+        },
+      },
+    },
+  )
+  .post(
     "/:phoneNumber/send-message",
     async ({ params, body }) => {
       const { phoneNumber } = params;
-      const { jid, messageContent } = body;
+      const { jid, messageContent, chatwootMessageId } = body;
 
-      const { messageContent: builtContent, quoted } =
-        buildMessageContent(messageContent);
+      const idempotencyKey =
+        chatwootMessageId !== undefined && chatwootMessageId !== null
+          ? `@baileys-api:idempotency:send-message:${phoneNumber}:${String(chatwootMessageId)}`
+          : null;
 
-      const response = await baileys.sendMessage(phoneNumber, {
-        jid,
-        messageContent: builtContent,
-        quoted,
+      const result = await withIdempotency(idempotencyKey, async () => {
+        const { messageContent: builtContent, quoted } =
+          buildMessageContent(messageContent);
+
+        const response = await baileys.sendMessage(phoneNumber, {
+          jid,
+          messageContent: builtContent,
+          quoted,
+        });
+
+        if (!response) return null;
+
+        return {
+          key: response.key,
+          messageTimestamp: response.messageTimestamp,
+        };
       });
 
-      if (!response) {
+      if (result.status === "processing") {
+        return new Response("Message is already being processed", {
+          status: 409,
+        });
+      }
+
+      if (result.status === "failed") {
         return new Response("Message not sent", { status: 500 });
       }
 
-      return {
-        data: {
-          key: response.key,
-          messageTimestamp: response.messageTimestamp,
-        },
-      };
+      return { data: result.value };
     },
     {
       params: phoneNumberParams,
       body: t.Object({
         jid: anyJid(),
         messageContent: anyMessageContent,
+        chatwootMessageId: t.Optional(t.Union([t.String(), t.Number()])),
       }),
       detail: {
         responses: {
@@ -160,6 +248,9 @@ const connectionsController = new Elysia({
                 }),
               },
             },
+          },
+          409: {
+            description: "Message is already being processed",
           },
           500: {
             description: "Message not sent",
@@ -481,6 +572,95 @@ const connectionsController = new Elysia({
     },
   )
   .get(
+    "/:phoneNumber/business-profile",
+    async ({ params, query }) => {
+      const { phoneNumber } = params;
+      const { jid } = query;
+
+      return baileys.getBusinessProfile(phoneNumber, jid);
+    },
+    {
+      params: phoneNumberParams,
+      query: t.Object({
+        jid: userJid(),
+      }),
+      detail: {
+        description: "Get business profile of a WhatsApp Business account",
+        responses: {
+          200: {
+            description: "Business profile retrieved successfully",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    wid: {
+                      type: "string",
+                      description: "WhatsApp ID of the business",
+                      example: "551234567890@s.whatsapp.net",
+                    },
+                    description: {
+                      type: "string",
+                      description: "Business description",
+                      example: "We are a company that sells products",
+                    },
+                    email: {
+                      type: "string",
+                      nullable: true,
+                      description: "Business email",
+                      example: "contact@business.com",
+                    },
+                    website: {
+                      type: "array",
+                      items: { type: "string" },
+                      description: "Business websites",
+                      example: ["https://business.com"],
+                    },
+                    category: {
+                      type: "string",
+                      nullable: true,
+                      description: "Business category",
+                      example: "Retail",
+                    },
+                    address: {
+                      type: "string",
+                      nullable: true,
+                      description: "Business address",
+                      example: "123 Main St, City",
+                    },
+                    business_hours: {
+                      type: "object",
+                      description: "Business hours configuration",
+                      properties: {
+                        timezone: {
+                          type: "string",
+                          description: "Timezone of the business",
+                          example: "America/Sao_Paulo",
+                        },
+                        config: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            properties: {
+                              day_of_week: { type: "string" },
+                              mode: { type: "string" },
+                              open_time: { type: "number" },
+                              close_time: { type: "number" },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  )
+  .get(
     "/:phoneNumber/group-metadata",
     async ({ params, query }) => {
       const { phoneNumber } = params;
@@ -740,6 +920,548 @@ const connectionsController = new Elysia({
         responses: {
           200: {
             description: "Group description updated successfully",
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/update-profile-picture",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { jid, image } = body;
+
+      const buffer = Buffer.from(image, "base64");
+      await baileys.updateProfilePicture(phoneNumber, jid, buffer);
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        jid: anyJid(),
+        image: t.String({
+          description: "Base64-encoded image data",
+        }),
+      }),
+      detail: {
+        description: "Update profile picture for a contact or group",
+        responses: {
+          200: {
+            description: "Profile picture updated successfully",
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-create",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { subject, participants } = body;
+
+      return baileys.groupCreate(phoneNumber, subject, participants);
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        subject: t.String({
+          description: "Group name/subject",
+          minLength: 1,
+          maxLength: 100,
+          example: "My New Group",
+        }),
+        participants: t.Array(userJid("Participant to add to the group"), {
+          description: "Array of participant JIDs to add to the group",
+          minItems: 1,
+        }),
+      }),
+      detail: {
+        description: "Create a new WhatsApp group",
+        responses: {
+          200: {
+            description: "Group created successfully",
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-leave",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { jid } = body;
+
+      await baileys.groupLeave(phoneNumber, jid);
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        jid: groupJid(),
+      }),
+      detail: {
+        description: "Leave a WhatsApp group",
+        responses: {
+          200: {
+            description: "Left group successfully",
+          },
+        },
+      },
+    },
+  )
+  .get(
+    "/:phoneNumber/group-request-participants-list",
+    async ({ params, query }) => {
+      const { phoneNumber } = params;
+      const { jid } = query;
+
+      return baileys.groupRequestParticipantsList(phoneNumber, jid);
+    },
+    {
+      params: phoneNumberParams,
+      query: t.Object({
+        jid: groupJid(),
+      }),
+      detail: {
+        description: "List pending join requests for a group",
+        responses: {
+          200: {
+            description: "Pending join requests retrieved successfully",
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-request-participants-update",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { jid, participants, action } = body;
+
+      return baileys.groupRequestParticipantsUpdate(
+        phoneNumber,
+        jid,
+        participants,
+        action,
+      );
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        jid: groupJid(),
+        participants: t.Array(userJid("Participant to approve or reject"), {
+          description: "Array of participant JIDs to approve or reject",
+          minItems: 1,
+        }),
+        action: t.Union(
+          [
+            t.Literal("approve", { title: "approve" }),
+            t.Literal("reject", { title: "reject" }),
+          ],
+          {
+            description: "Action to perform on join requests",
+            example: "approve",
+          },
+        ),
+      }),
+      detail: {
+        description: "Approve or reject pending join requests for a group",
+        responses: {
+          200: {
+            description: "Join requests updated successfully",
+          },
+        },
+      },
+    },
+  )
+  .get(
+    "/:phoneNumber/group-invite-code",
+    async ({ params, query }) => {
+      const { phoneNumber } = params;
+      const { jid } = query;
+
+      const code = await baileys.groupInviteCode(phoneNumber, jid);
+
+      return { data: { jid, inviteCode: code || null } };
+    },
+    {
+      params: phoneNumberParams,
+      query: t.Object({
+        jid: groupJid(),
+      }),
+      detail: {
+        description: "Get the invite code for a group",
+        responses: {
+          200: {
+            description: "Invite code retrieved successfully",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: {
+                      type: "object",
+                      properties: {
+                        jid: { type: "string" },
+                        inviteCode: { type: "string", nullable: true },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-revoke-invite",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { jid } = body;
+
+      const newCode = await baileys.groupRevokeInvite(phoneNumber, jid);
+
+      return { data: { jid, inviteCode: newCode || null } };
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        jid: groupJid(),
+      }),
+      detail: {
+        description:
+          "Revoke the current invite code and generate a new one for a group",
+        responses: {
+          200: {
+            description: "Invite code revoked successfully",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: {
+                      type: "object",
+                      properties: {
+                        jid: { type: "string" },
+                        inviteCode: { type: "string", nullable: true },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-accept-invite",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { code } = body;
+
+      const groupJid = await baileys.groupAcceptInvite(phoneNumber, code);
+
+      return { data: { groupJid: groupJid || null } };
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        code: t.String({
+          description: "Group invite code",
+          example: "ABC123xyz",
+        }),
+      }),
+      detail: {
+        description: "Join a group using an invite code",
+        responses: {
+          200: {
+            description: "Joined group successfully",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: {
+                      type: "object",
+                      properties: {
+                        groupJid: { type: "string", nullable: true },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-revoke-invite-v4",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { groupJid: gJid, invitedJid } = body;
+
+      const result = await baileys.groupRevokeInviteV4(
+        phoneNumber,
+        gJid,
+        invitedJid,
+      );
+
+      return { data: { revoked: result } };
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        groupJid: groupJid(),
+        invitedJid: userJid("JID of the invited user"),
+      }),
+      detail: {
+        description: "Revoke a V4 invite for a specific user",
+        responses: {
+          200: {
+            description: "V4 invite revoked successfully",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: {
+                      type: "object",
+                      properties: {
+                        revoked: { type: "boolean" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-accept-invite-v4",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { key, inviteMessage } = body;
+
+      const result = await baileys.groupAcceptInviteV4(
+        phoneNumber,
+        key,
+        inviteMessage,
+      );
+
+      return { data: result };
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        key: t.Union([
+          t.String({ description: "Invite key as string" }),
+          iMessageKeyWithId,
+        ]),
+        inviteMessage: t.Object(
+          {
+            groupJid: groupJid("target group for the invite"),
+            inviteCode: t.String({ description: "Invite code" }),
+            inviteExpiration: t.Optional(t.Number()),
+            groupName: t.Optional(t.String()),
+            caption: t.Optional(t.String()),
+          },
+          {
+            description: "Group invite message content",
+          },
+        ),
+      }),
+      detail: {
+        description: "Accept a V4 group invite message",
+        responses: {
+          200: {
+            description: "V4 invite accepted successfully",
+          },
+        },
+      },
+    },
+  )
+  .get(
+    "/:phoneNumber/group-invite-info",
+    async ({ params, query }) => {
+      const { phoneNumber } = params;
+      const { code } = query;
+
+      return baileys.groupGetInviteInfo(phoneNumber, code);
+    },
+    {
+      params: phoneNumberParams,
+      query: t.Object({
+        code: t.String({
+          description: "Group invite code",
+          example: "ABC123xyz",
+        }),
+      }),
+      detail: {
+        description:
+          "Get group metadata from an invite code without joining the group",
+        responses: {
+          200: {
+            description: "Group invite info retrieved successfully",
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-toggle-ephemeral",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { jid, ephemeralExpiration } = body;
+
+      await baileys.groupToggleEphemeral(phoneNumber, jid, ephemeralExpiration);
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        jid: groupJid(),
+        ephemeralExpiration: t.Number({
+          description:
+            "Duration in seconds for disappearing messages. Use 0 to disable.",
+          minimum: 0,
+          example: 604800,
+        }),
+      }),
+      detail: {
+        description: "Toggle disappearing messages for a group",
+        responses: {
+          200: {
+            description: "Ephemeral setting updated successfully",
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-setting-update",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { jid, setting } = body;
+
+      await baileys.groupSettingUpdate(phoneNumber, jid, setting);
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        jid: groupJid(),
+        setting: t.Union(
+          [
+            t.Literal("announcement", { title: "announcement" }),
+            t.Literal("not_announcement", { title: "not_announcement" }),
+            t.Literal("locked", { title: "locked" }),
+            t.Literal("unlocked", { title: "unlocked" }),
+          ],
+          {
+            description:
+              "Group setting to update. `announcement` makes only admins able to send messages. `not_announcement` allows all participants. `locked` makes only admins able to edit group info. `unlocked` allows all participants to edit.",
+            example: "announcement",
+          },
+        ),
+      }),
+      detail: {
+        description: "Update group settings (announcement/locked mode)",
+        responses: {
+          200: {
+            description: "Group setting updated successfully",
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-member-add-mode",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { jid, mode } = body;
+
+      await baileys.groupMemberAddMode(phoneNumber, jid, mode);
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        jid: groupJid(),
+        mode: t.Union(
+          [
+            t.Literal("admin_add", { title: "admin_add" }),
+            t.Literal("all_member_add", { title: "all_member_add" }),
+          ],
+          {
+            description:
+              "Who can add members. `admin_add` restricts to admins only. `all_member_add` allows all members.",
+            example: "all_member_add",
+          },
+        ),
+      }),
+      detail: {
+        description: "Set who can add members to the group",
+        responses: {
+          200: {
+            description: "Member add mode updated successfully",
+          },
+        },
+      },
+    },
+  )
+  .post(
+    "/:phoneNumber/group-join-approval-mode",
+    async ({ params, body }) => {
+      const { phoneNumber } = params;
+      const { jid, mode } = body;
+
+      await baileys.groupJoinApprovalMode(phoneNumber, jid, mode);
+    },
+    {
+      params: phoneNumberParams,
+      body: t.Object({
+        jid: groupJid(),
+        mode: t.Union(
+          [
+            t.Literal("on", { title: "on" }),
+            t.Literal("off", { title: "off" }),
+          ],
+          {
+            description:
+              "Whether join requests require admin approval. `on` enables approval mode, `off` disables it.",
+            example: "on",
+          },
+        ),
+      }),
+      detail: {
+        description: "Toggle join approval mode for a group",
+        responses: {
+          200: {
+            description: "Join approval mode updated successfully",
+          },
+        },
+      },
+    },
+  )
+  .get(
+    "/:phoneNumber/group-fetch-all-participating",
+    async ({ params }) => {
+      const { phoneNumber } = params;
+
+      return baileys.groupFetchAllParticipating(phoneNumber);
+    },
+    {
+      params: phoneNumberParams,
+      detail: {
+        description:
+          "Fetch metadata for all groups the connected number is participating in",
+        responses: {
+          200: {
+            description: "All group metadata retrieved successfully",
           },
         },
       },
