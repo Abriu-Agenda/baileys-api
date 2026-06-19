@@ -16,6 +16,7 @@ import makeWASocket, {
   type WAConnectionState,
   type WAMessage,
   type WAMessageKey,
+  WAMessageStatus,
   type WAPresence,
 } from "@whiskeysockets/baileys";
 import { toDataURL } from "qrcode";
@@ -24,17 +25,38 @@ import { fetchBaileysClientVersion } from "@/baileys/helpers/fetchBaileysClientV
 import { normalizeBrazilPhoneNumber } from "@/baileys/helpers/normalizeBrazilPhoneNumber";
 import { preprocessAudio } from "@/baileys/helpers/preprocessAudio";
 import { shouldIgnoreJid } from "@/baileys/helpers/shouldIgnoreJid";
-import { useRedisAuthState } from "@/baileys/redisAuthState";
+import { useRedisAuthState, writeAuthMetadata } from "@/baileys/redisAuthState";
 import type {
   BaileysConnectionOptions,
   BaileysConnectionWebhookPayload,
   MessageKeyWithId,
 } from "@/baileys/types";
+import { instanceId } from "@/cluster/identity";
+import { getLease } from "@/cluster/leaseStore";
 import config from "@/config";
 import { asyncSleep } from "@/helpers/asyncSleep";
 import { errorToString } from "@/helpers/errorToString";
 import logger, { baileysLogger, deepSanitizeObject } from "@/lib/logger";
-import redis from "@/lib/redis";
+
+// `connectionReplaced` (440 conflict/replaced) usually clears on the next attempt,
+// so default behavior is a normal reconnect. When the same disconnect repeats
+// rapidly it indicates another session is competing for this slot and the tight
+// retry only feeds the loop, so after the threshold we add a backoff.
+const CONNECTION_REPLACED_LOOP_WINDOW_MS = 30_000;
+const CONNECTION_REPLACED_LOOP_THRESHOLD = 5;
+const CONNECTION_REPLACED_BACKOFF_MS = 30_000;
+
+// Per-message NACK code WhatsApp returns when an outgoing message hits the
+// reach-out time-lock ("account restricted", error 463). It surfaces to us as
+// a messages.update with status ERROR carrying this code in
+// messageStubParameters. See messages-recv.js in @whiskeysockets/baileys.
+const MESSAGE_ACCOUNT_RESTRICTION_CODE = "463";
+// On a 463 we actively query the authoritative restriction state from
+// WhatsApp (fetchAccountReachoutTimelock), which emits a connection.update
+// carrying reachoutTimeLock. A burst of 463s (mass cold outreach) would
+// otherwise fire one query per failed message; debounce so we query at most
+// once per window per connection.
+const REACHOUT_TIMELOCK_REFETCH_WINDOW_MS = 60_000;
 
 export class BaileysNotConnectedError extends Error {
   constructor() {
@@ -70,8 +92,10 @@ export class BaileysConnection {
     "connection.update",
     "creds.update",
     "messaging-history.set",
+    "messaging-history.status",
     "chats.upsert",
     "chats.update",
+    "chats.lock",
     "lid-mapping.update",
     "chats.delete",
     "presence.update",
@@ -83,10 +107,12 @@ export class BaileysConnection {
     "messages.upsert",
     "messages.reaction",
     "message-receipt.update",
+    "message-capping.update",
     "groups.upsert",
     "groups.update",
     "group-participants.update",
     "group.join-request",
+    "group.member-tag.update",
     "blocklist.set",
     "blocklist.update",
     "call",
@@ -96,6 +122,7 @@ export class BaileysConnection {
     "newsletter.view",
     "newsletter-participants.update",
     "newsletter-settings.update",
+    "settings.update",
   ];
 
   private phoneNumber: string;
@@ -111,6 +138,14 @@ export class BaileysConnection {
   private clearOnlinePresenceTimeout: ReturnType<typeof setTimeout> | null =
     null;
   private reconnectCount = 0;
+  private connectionReplacedTimestamps: number[] = [];
+  private isDiscarded = false;
+  private _inFlightWebhooks = 0;
+  private leaseEpoch: number | null = null;
+  // Monotonic timestamp of the last message-level traffic (received message,
+  // outgoing send, receipt update). null = no traffic since this connection
+  // object was created. Drives idle-aware handoff in the coordinator.
+  private _lastTrafficAt: number | null = null;
   private groupsEnabled: boolean;
   private autoPresenceSubscribe: boolean;
   private _apiKeyHash: string | null;
@@ -119,6 +154,10 @@ export class BaileysConnection {
     { unreadCount: number; lastMessageAt: number }
   > = new Map();
   private groupActivityInterval: ReturnType<typeof setInterval> | null = null;
+  // Debounce bookkeeping for the active reach-out time-lock query triggered on
+  // a 463 (see handleMessagesUpdate / fetchReachoutTimelockOn463).
+  private reachoutTimelockFetchInFlight = false;
+  private lastReachoutTimelockFetchAt = 0;
 
   constructor(phoneNumber: string, options: BaileysConnectionOptions) {
     this.phoneNumber = phoneNumber;
@@ -135,10 +174,23 @@ export class BaileysConnection {
     this.groupsEnabled = options.groupsEnabled ?? true;
     this.autoPresenceSubscribe = options.autoPresenceSubscribe ?? false;
     this._apiKeyHash = options.apiKeyHash ?? null;
+    this.leaseEpoch = options.leaseEpoch ?? null;
   }
 
   get apiKeyHash(): string | null {
     return this._apiKeyHash;
+  }
+
+  get inFlightWebhooks(): number {
+    return this._inFlightWebhooks;
+  }
+
+  get lastTrafficAt(): number | null {
+    return this._lastTrafficAt;
+  }
+
+  private markTraffic() {
+    this._lastTrafficAt = performance.now();
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: Typing this wrapper is not trivial.
@@ -160,7 +212,7 @@ export class BaileysConnection {
     };
   }
 
-  updateOptions(options: BaileysConnectionOptions) {
+  async updateOptions(options: BaileysConnectionOptions) {
     this.clientName = options.clientName || "Chrome";
     this.webhookUrl = options.webhookUrl;
     this.webhookVerifyToken = options.webhookVerifyToken;
@@ -179,29 +231,33 @@ export class BaileysConnection {
 
     this.autoPresenceSubscribe = options.autoPresenceSubscribe ?? false;
     this._apiKeyHash = options.apiKeyHash ?? this._apiKeyHash;
-    this.persistMetadata();
+    // A reused connection may have been re-leased under a newer epoch (e.g. a
+    // force-acquire on POST /connections); stale epochs would get the
+    // webhooks discarded by the client.
+    if (options.leaseEpoch !== undefined) {
+      this.leaseEpoch = options.leaseEpoch;
+    }
+    await this.persistMetadata();
   }
 
-  private persistMetadata() {
-    const key = `@baileys-api:connections:${this.phoneNumber}:authState`;
-    redis.hSet(
-      key,
-      "metadata",
-      JSON.stringify({
-        clientName: this.clientName,
-        webhookUrl: this.webhookUrl,
-        webhookVerifyToken: this.webhookVerifyToken,
-        includeMedia: this.includeMedia,
-        syncFullHistory: this.syncFullHistory,
-        groupsEnabled: this.groupsEnabled,
-        autoPresenceSubscribe: this.autoPresenceSubscribe,
-        apiKeyHash: this._apiKeyHash,
-      }),
-    );
+  private async persistMetadata() {
+    // Owner-fenced: updateOptions can run on a connection whose lease has
+    // since moved, and an unfenced write here would overwrite the new
+    // owner's metadata (see writeAuthMetadata).
+    await writeAuthMetadata(this.phoneNumber, {
+      clientName: this.clientName,
+      webhookUrl: this.webhookUrl,
+      webhookVerifyToken: this.webhookVerifyToken,
+      includeMedia: this.includeMedia,
+      syncFullHistory: this.syncFullHistory,
+      groupsEnabled: this.groupsEnabled,
+      autoPresenceSubscribe: this.autoPresenceSubscribe,
+      apiKeyHash: this._apiKeyHash,
+    });
   }
 
   async connect() {
-    if (this.socket) {
+    if (this.isDiscarded || this.socket) {
       return;
     }
 
@@ -215,26 +271,56 @@ export class BaileysConnection {
       autoPresenceSubscribe: this.autoPresenceSubscribe,
       apiKeyHash: this._apiKeyHash,
     });
+    // Re-check after each await — discard() may have run while we were
+    // loading auth state or fetching the version. Without this, the
+    // discarded instance would still call makeWASocket() and race the
+    // replacement on the same identity.
+    if (this.isDiscarded) {
+      return;
+    }
     this.clearAuthState = state.keys.clear;
+
+    const version = await fetchBaileysClientVersion().catch((error) => {
+      logger.error(
+        "[%s] [fetchBaileysVersion] Failed to fetch latest WhatsApp Web version, falling back to internal version. %s",
+        this.phoneNumber,
+        errorToString(error),
+      );
+      return undefined;
+    });
+    if (this.isDiscarded) {
+      return;
+    }
+
+    // A discarded connection must never write Signal state again — its
+    // identity may already be live on another instance (or on a local
+    // replacement). This entry guard is a best-effort fast path; the
+    // authoritative fence is the Redis-side write-if-owner script, which
+    // rejects any write once the lease moves to a new owner. A write already
+    // in flight when discard() lands can only commit while no successor holds
+    // the lease, i.e. it is the closing socket's final state flush — exactly
+    // what the next owner should resume from.
+    const guardedKeys: AuthenticationState["keys"] = {
+      ...state.keys,
+      set: async (data) => {
+        if (this.isDiscarded) {
+          return;
+        }
+        await state.keys.set(data);
+      },
+    };
 
     const socketOptions: UserFacingSocketConfig = {
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
+        keys: makeCacheableSignalKeyStore(guardedKeys, logger),
       },
       markOnlineOnConnect: false,
       logger: baileysLogger,
       browser: Browsers.windows(this.clientName),
       syncFullHistory: this.syncFullHistory,
       shouldIgnoreJid,
-      version: await fetchBaileysClientVersion().catch((error) => {
-        logger.error(
-          "[%s] [fetchBaileysVersion] Failed to fetch latest WhatsApp Web version, falling back to internal version. %s",
-          this.phoneNumber,
-          errorToString(error),
-        );
-        return undefined;
-      }),
+      version,
     };
 
     try {
@@ -260,7 +346,13 @@ export class BaileysConnection {
     };
 
     const handledEvents: EventHandlers = {
-      "creds.update": saveCreds,
+      "creds.update": this.withErrorHandling("saveCreds", async () => {
+        // See guardedKeys: a discarded socket must not persist creds.
+        if (this.isDiscarded) {
+          return;
+        }
+        await saveCreds();
+      }),
       "connection.update": this.withErrorHandling(
         "handleConnectionUpdate",
         this.handleConnectionUpdate,
@@ -276,6 +368,13 @@ export class BaileysConnection {
       "message-receipt.update": this.withErrorHandling(
         "handleMessageReceiptUpdate",
         this.handleMessageReceiptUpdate,
+      ),
+      // Antecedent signal to the 463 restriction: WhatsApp's new-chat message
+      // cap. Handled (not left to the generic forwarder) so it is always
+      // delivered, independent of BAILEYS_LISTEN_TO_EVENTS.
+      "message-capping.update": this.withErrorHandling(
+        "handleMessageCappingUpdate",
+        this.handleMessageCappingUpdate,
       ),
       "messaging-history.set": this.withErrorHandling(
         "handleMessagingHistorySet",
@@ -321,10 +420,17 @@ export class BaileysConnection {
     this.clearAuthState = null;
     this.socket = null;
     this.reconnectCount = 0;
+    this.connectionReplacedTimestamps = [];
     this.onConnectionClose?.();
   }
 
   async logout() {
+    // Mark as discarded up front so any close event the socket emits during
+    // the logout flow (e.g. a connectionReplaced from another device while
+    // we're awaiting the WhatsApp logout RPC) is treated as terminal by
+    // handleConnectionUpdate and does not schedule a reconnect that would
+    // resurrect the socket while logout is still in flight.
+    this.isDiscarded = true;
     try {
       await this.safeSocket().logout();
     } catch (error) {
@@ -337,12 +443,60 @@ export class BaileysConnection {
     await this.close();
   }
 
+  // Atomically disowns this connection so it cannot resurrect itself.
+  // Used by the handler when a stale connection is being replaced (e.g.
+  // recovery path from BaileysNotConnectedError, or a stuck reconnect
+  // backoff). Does NOT clear the Redis auth state — the replacement will
+  // reuse the same identity — and does NOT fire onConnectionClose — the
+  // handler driving the discard already owns the replacement, and a late
+  // callback would only race with it.
+  discard() {
+    if (this.isDiscarded) {
+      return;
+    }
+    this.isDiscarded = true;
+    this.onConnectionClose = null;
+    this.stopGroupActivityFlush();
+    if (this.clearOnlinePresenceTimeout) {
+      clearTimeout(this.clearOnlinePresenceTimeout);
+      this.clearOnlinePresenceTimeout = null;
+    }
+    try {
+      // Drop listeners first so the synchronous `connection.update {close}`
+      // that `end()` emits doesn't reach handleConnectionUpdate at all.
+      // The flag guards a second line of defense, but unsubscribing keeps
+      // the handler graph clean even if a stray event slips through.
+      this.socket?.ev.removeAllListeners("connection.update");
+      this.socket?.end(undefined);
+    } catch (error) {
+      logger.warn(
+        "[%s] [discard] error while ending socket: %s",
+        this.phoneNumber,
+        errorToString(error),
+      );
+    }
+    this.socket = null;
+  }
+
+  // Terminal teardown for a connection that gives up on itself (e.g. a
+  // reconnect loop that never stabilizes). Unlike close(), preserves the
+  // Redis auth state so the same identity can be resumed later — by a new
+  // POST /connections or by another instance sharing this Redis. Unlike
+  // discard(), fires onConnectionClose so the handler evicts this instance
+  // from its registry.
+  private abort() {
+    const onConnectionClose = this.onConnectionClose;
+    this.discard();
+    onConnectionClose?.();
+  }
+
   async sendMessage(
     jid: string,
     messageContent: AnyMessageContent,
     options?: { quoted?: WAMessage },
   ) {
     this.safeSocket();
+    this.markTraffic();
     this.autoSubscribePresence(jid);
 
     let waveformProxy: Buffer | null = null;
@@ -509,6 +663,17 @@ export class BaileysConnection {
     return this.safeSocket().profilePictureUrl(jid, type);
   }
 
+  // Read-only restriction diagnostics. Both query WhatsApp directly via MEX
+  // (GraphQL) queries — they do NOT send a message, so they are safe to call
+  // on a 463-restricted account without worsening the reach-out time-lock.
+  getReachoutTimelock() {
+    return this.safeSocket().fetchAccountReachoutTimelock();
+  }
+
+  getNewChatMessageCap() {
+    return this.safeSocket().fetchNewChatMessageCap();
+  }
+
   async updateProfilePicture(jid: string, image: Buffer) {
     return this.safeSocket().updateProfilePicture(jid, image);
   }
@@ -623,7 +788,32 @@ export class BaileysConnection {
   }
 
   private async handleConnectionUpdate(data: Partial<ConnectionState>) {
+    // A discarded connection must be inert. `socket.end()` fires a final
+    // connection.update before the listeners are torn down; without this
+    // guard the handler would dispatch `reconnecting` webhooks and even
+    // attempt a reconnect on a connection the handler already replaced.
+    if (this.isDiscarded) {
+      return;
+    }
+
     const { connection, qr, lastDisconnect, isNewLogin, isOnline } = data;
+
+    // WhatsApp's authoritative reach-out time-lock state (the restriction
+    // behind error 463). It rides on connection.update — sometimes standalone
+    // (no `connection` field), e.g. when emitted by fetchAccountReachoutTimelock
+    // — and falls through to the sendToWebhook below. Destructured explicitly
+    // and logged so it stays visible in production and a future refactor of
+    // this handler cannot silently drop the pass-through.
+    const { reachoutTimeLock } = data;
+    if (reachoutTimeLock) {
+      logger.info(
+        "[%s] [handleConnectionUpdate] reachoutTimeLock update (isActive=%s, enforcementType=%s, ends=%s)",
+        this.phoneNumber,
+        String(reachoutTimeLock.isActive ?? false),
+        reachoutTimeLock.enforcementType ?? "",
+        reachoutTimeLock.timeEnforcementEnds?.toISOString?.() ?? "",
+      );
+    }
 
     // NOTE: Reconnection flow
     // - `isNewLogin`: sent after close on first connection (see `shouldReconnect` below). We send a `reconnecting` update to indicate qr code has been read.
@@ -658,6 +848,17 @@ export class BaileysConnection {
         message !== "QR refs attempts ended";
 
       if (shouldReconnect) {
+        // Distributed fence: a conflict/replaced kick may mean another
+        // instance legitimately took this identity over (its lease says so).
+        // Yield instead of stealing the connection back — the in-memory
+        // backoff below only throttles that fight, it doesn't end it.
+        if (
+          statusCode === DisconnectReason.connectionReplaced &&
+          (await this.shouldYieldToLeaseOwner())
+        ) {
+          this.abort();
+          return;
+        }
         logger.debug(
           "[%s] [handleConnectionUpdate] Reconnecting (lastDisconnect=%o)",
           this.phoneNumber,
@@ -666,6 +867,21 @@ export class BaileysConnection {
         await this.handleReconnecting();
         // NOTE: We don't call `this.close()` here because we want to keep the auth state.
         this.socket = null;
+
+        if (statusCode === DisconnectReason.connectionReplaced) {
+          const recentCount = this.trackConnectionReplaced();
+          if (recentCount >= CONNECTION_REPLACED_LOOP_THRESHOLD) {
+            logger.warn(
+              "[%s] [handleConnectionUpdate] connectionReplaced loop detected (%d events in %dms window), backing off %dms before reconnect",
+              this.phoneNumber,
+              recentCount,
+              CONNECTION_REPLACED_LOOP_WINDOW_MS,
+              CONNECTION_REPLACED_BACKOFF_MS,
+            );
+            await asyncSleep(CONNECTION_REPLACED_BACKOFF_MS);
+          }
+        }
+
         this.connect();
         return;
       }
@@ -706,6 +922,7 @@ export class BaileysConnection {
   }
 
   private async handleMessagesUpsert(data: BaileysEventMap["messages.upsert"]) {
+    this.markTraffic();
     if (data.type === "notify") {
       for (const msg of data.messages) {
         const remoteJid = msg.key?.remoteJid;
@@ -756,6 +973,19 @@ export class BaileysConnection {
   }
 
   private handleMessagesUpdate(data: BaileysEventMap["messages.update"]) {
+    // Edits, deletions and reactions are conversation activity too — a
+    // connection seeing them must not look idle to the rebalancer.
+    this.markTraffic();
+
+    // A 463 ("account restricted") surfaces here as a status=ERROR update. The
+    // Baileys 463 handler does not emit the reach-out time-lock state on its
+    // own, so we actively query it: the resulting connection.update carries
+    // reachoutTimeLock to the webhook, giving the consumer a structured,
+    // authoritative signal instead of just a failed message.
+    if (this.hasAccountRestrictionError(data)) {
+      this.fetchReachoutTimelockOn463();
+    }
+
     this.sendToWebhook(
       {
         event: "messages.update",
@@ -767,9 +997,62 @@ export class BaileysConnection {
     );
   }
 
+  private hasAccountRestrictionError(
+    data: BaileysEventMap["messages.update"],
+  ): boolean {
+    return data.some(
+      ({ update }) =>
+        update?.status === WAMessageStatus.ERROR &&
+        Array.isArray(update.messageStubParameters) &&
+        update.messageStubParameters.includes(MESSAGE_ACCOUNT_RESTRICTION_CODE),
+    );
+  }
+
+  // Fire-and-forget, debounced. fetchAccountReachoutTimelock emits a
+  // connection.update { reachoutTimeLock } which handleConnectionUpdate
+  // forwards to the webhook. Safe on a restricted account (read-only MEX
+  // query, sends no message).
+  private fetchReachoutTimelockOn463() {
+    if (this.reachoutTimelockFetchInFlight) {
+      return;
+    }
+    const now = Date.now();
+    if (
+      now - this.lastReachoutTimelockFetchAt <
+      REACHOUT_TIMELOCK_REFETCH_WINDOW_MS
+    ) {
+      return;
+    }
+    this.reachoutTimelockFetchInFlight = true;
+    this.lastReachoutTimelockFetchAt = now;
+    void (async () => {
+      try {
+        await this.getReachoutTimelock();
+      } catch (error) {
+        logger.warn(
+          "[%s] [fetchReachoutTimelockOn463] failed to fetch reachout timelock: %s",
+          this.phoneNumber,
+          errorToString(error),
+        );
+      } finally {
+        this.reachoutTimelockFetchInFlight = false;
+      }
+    })();
+  }
+
+  private handleMessageCappingUpdate(
+    data: BaileysEventMap["message-capping.update"],
+  ) {
+    this.sendToWebhook({
+      event: "message-capping.update",
+      data,
+    });
+  }
+
   private handleMessageReceiptUpdate(
     data: BaileysEventMap["message-receipt.update"],
   ) {
+    this.markTraffic();
     this.sendToWebhook({
       event: "message-receipt.update",
       data,
@@ -849,16 +1132,57 @@ export class BaileysConnection {
     this.reconnectCount += 1;
     if (this.reconnectCount > 10) {
       logger.warn(
-        "[%s] [handleReconnecting] Reconnect count exceeded 10, resetting connection",
+        "[%s] [handleReconnecting] Reconnect count exceeded 10, aborting reconnection (auth state preserved)",
         this.phoneNumber,
       );
-      await this.close();
+      this.sendToWebhook({
+        event: "connection.update",
+        data: { error: "reconnect_loop_detected" },
+      });
+      this.abort();
       return;
     }
     this.sendToWebhook({
       event: "connection.update",
       data: { connection: "reconnecting" as WAConnectionState },
     });
+  }
+
+  // True only when the lease verifiably belongs to another instance. On any
+  // doubt (no lease system state, Redis unreachable) we keep the
+  // single-instance behavior — reconnect with backoff — because wrongly
+  // yielding here silently kills a healthy connection.
+  private async shouldYieldToLeaseOwner(): Promise<boolean> {
+    try {
+      const lease = await getLease(this.phoneNumber);
+      if (lease && lease.owner !== instanceId) {
+        logger.info(
+          "[%s] [shouldYieldToLeaseOwner] lease is owned by %s (epoch %d), yielding",
+          this.phoneNumber,
+          lease.owner,
+          lease.epoch,
+        );
+        return true;
+      }
+      return false;
+    } catch (error) {
+      logger.warn(
+        "[%s] [shouldYieldToLeaseOwner] could not verify lease, keeping reconnect behavior: %s",
+        this.phoneNumber,
+        errorToString(error),
+      );
+      return false;
+    }
+  }
+
+  private trackConnectionReplaced(): number {
+    const now = Date.now();
+    this.connectionReplacedTimestamps =
+      this.connectionReplacedTimestamps.filter(
+        (ts) => now - ts <= CONNECTION_REPLACED_LOOP_WINDOW_MS,
+      );
+    this.connectionReplacedTimestamps.push(now);
+    return this.connectionReplacedTimestamps.length;
   }
 
   private startGroupActivityFlush() {
@@ -901,7 +1225,38 @@ export class BaileysConnection {
     this.flushGroupActivity();
   }
 
+  // Counts deliveries (including their retry windows) still running in this
+  // process's memory. Graceful shutdown waits on this before exiting so a
+  // handoff doesn't drop events that WhatsApp already considers delivered.
   private async sendToWebhook(
+    payload: BaileysConnectionWebhookPayload,
+    options?: {
+      awaitResponse?: boolean;
+    },
+  ) {
+    // connection.update events carry the lease epoch so the client can
+    // discard late events from a previous owner (last-writer-wins on the
+    // chatwoot side would otherwise let a stale "reconnecting" overwrite the
+    // new owner's "open").
+    let enriched = payload;
+    if (payload.event === "connection.update" && this.leaseEpoch !== null) {
+      enriched = {
+        ...payload,
+        data: {
+          ...(payload.data as BaileysEventMap["connection.update"]),
+          epoch: this.leaseEpoch,
+        },
+      };
+    }
+    this._inFlightWebhooks += 1;
+    try {
+      return await this.deliverToWebhook(enriched, options);
+    } finally {
+      this._inFlightWebhooks -= 1;
+    }
+  }
+
+  private async deliverToWebhook(
     payload: BaileysConnectionWebhookPayload,
     options?: {
       awaitResponse?: boolean;

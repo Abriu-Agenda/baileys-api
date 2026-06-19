@@ -7,6 +7,7 @@ const mockConnectionInstances: Map<string, any> = new Map();
 
 const mockConnect = mock(async function (this: any) {});
 const mockLogout = mock(async function (this: any) {});
+const mockDiscard = mock(function (this: any) {});
 const mockSendPresenceUpdate = mock(async function (this: any) {});
 const mockSendMessage = mock(async function (this: any) {});
 const mockReadMessages = mock(async function (this: any) {});
@@ -68,6 +69,8 @@ class MockBaileysConnection {
   phoneNumber: string;
   options: any;
   _apiKeyHash: string | null;
+  inFlightWebhooks = 0;
+  lastTrafficAt: number | null = null;
 
   constructor(phoneNumber: string, options: any) {
     this.phoneNumber = phoneNumber;
@@ -81,6 +84,7 @@ class MockBaileysConnection {
   }
   connect = mockConnect;
   logout = mockLogout;
+  discard = mockDiscard;
   sendPresenceUpdate = mockSendPresenceUpdate;
   sendMessage = mockSendMessage;
   readMessages = mockReadMessages;
@@ -115,15 +119,10 @@ class MockBaileysConnection {
   presenceSubscribe = mockPresenceSubscribe;
 }
 
-mock.module("@/baileys/redisAuthState", () => ({
-  getRedisSavedAuthStateIds: mock(async () => []),
-}));
-
 import {
   BaileysConnectionForbiddenError,
   BaileysNotConnectedError,
 } from "@/baileys/connection";
-import { getRedisSavedAuthStateIds } from "@/baileys/redisAuthState";
 import redis from "@/lib/redis";
 import { BaileysConnectionsHandler } from "./connectionsHandler";
 
@@ -142,6 +141,7 @@ describe("BaileysConnectionsHandler", () => {
     mockConnectionInstances.clear();
     mockConnect.mockClear();
     mockLogout.mockClear();
+    mockDiscard.mockClear();
     mockSendPresenceUpdate.mockClear();
     mockSendMessage.mockClear();
     mockReadMessages.mockClear();
@@ -176,46 +176,97 @@ describe("BaileysConnectionsHandler", () => {
     mockPresenceSubscribe.mockClear();
   });
 
-  describe("#reconnectFromAuthStore", () => {
-    it("does nothing when no saved connections exist", async () => {
-      (
-        getRedisSavedAuthStateIds as ReturnType<typeof mock>
-      ).mockResolvedValueOnce([]);
-      await handler.reconnectFromAuthStore();
-      expect(mockConnect).not.toHaveBeenCalled();
+  describe("#discardConnection", () => {
+    it("discards the connection and removes it without touching auth state", async () => {
+      await handler.connect("+5511999", defaultOptions);
+      mockDiscard.mockClear();
+
+      await handler.discardConnection("+5511999");
+
+      expect(mockDiscard).toHaveBeenCalledTimes(1);
+      expect(mockLogout).not.toHaveBeenCalled();
+      expect(handler.hasConnection("+5511999")).toBe(false);
     });
 
-    it("reconnects saved connections", async () => {
-      (
-        getRedisSavedAuthStateIds as ReturnType<typeof mock>
-      ).mockResolvedValueOnce([
-        {
-          id: "+5511999",
-          metadata: {
-            webhookUrl: "https://hook1.com",
-            webhookVerifyToken: "t1",
-          },
-        },
-        {
-          id: "+5521888",
-          metadata: {
-            webhookUrl: "https://hook2.com",
-            webhookVerifyToken: "t2",
-          },
-        },
+    it("is a no-op when the connection does not exist", async () => {
+      await handler.discardConnection("+5511999");
+      expect(mockDiscard).not.toHaveBeenCalled();
+    });
+
+    it("keeps in-flight webhooks of a discarded connection visible until they drain", async () => {
+      // The shutdown drain waits on inFlightWebhookCount() AFTER discarding
+      // each phone — a discarded connection with a retrying webhook must
+      // still hold the drain open or the process exits mid-delivery.
+      await handler.connect("+5511999", defaultOptions);
+      const connection = mockConnectionInstances.get("+5511999")!;
+      connection.inFlightWebhooks = 2;
+
+      await handler.discardConnection("+5511999");
+
+      expect(handler.hasConnection("+5511999")).toBe(false);
+      expect(handler.inFlightWebhookCount()).toBe(2);
+
+      connection.inFlightWebhooks = 0;
+      expect(handler.inFlightWebhookCount()).toBe(0);
+    });
+
+    it("waits for an in-flight spawn before discarding", async () => {
+      // A self-fence arriving while a connect is mid-flight must not run
+      // before the spawn settles — otherwise the freshly created socket
+      // would survive the discard, still authenticated with the identity
+      // that now belongs to another instance.
+      let resolveSlowConnect: () => void = () => {};
+      mockConnect.mockImplementationOnce(
+        () =>
+          new Promise<void>((res) => {
+            resolveSlowConnect = res;
+          }),
+      );
+
+      const connectPromise = handler.connect("+5511999", defaultOptions);
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      const discardPromise = handler.discardConnection("+5511999");
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      expect(mockDiscard).not.toHaveBeenCalled();
+
+      resolveSlowConnect();
+      await connectPromise;
+      await discardPromise;
+
+      expect(mockDiscard).toHaveBeenCalledTimes(1);
+      expect(handler.hasConnection("+5511999")).toBe(false);
+    });
+  });
+
+  describe("accessors", () => {
+    it("exposes active phone numbers and size", async () => {
+      expect(handler.size).toBe(0);
+      expect(handler.getActivePhoneNumbers()).toEqual([]);
+
+      await handler.connect("+5511999", defaultOptions);
+      await handler.connect("+5521888", defaultOptions);
+
+      expect(handler.size).toBe(2);
+      expect(handler.getActivePhoneNumbers().sort()).toEqual([
+        "+5511999",
+        "+5521888",
       ]);
+      expect(handler.hasConnection("+5511999")).toBe(true);
+      expect(handler.hasConnection("+5530000")).toBe(false);
+    });
 
-      await handler.reconnectFromAuthStore();
-      expect(mockConnect).toHaveBeenCalledTimes(2);
-      expect(mockConnectionInstances.size).toBe(2);
+    it("exposes per-connection activity", async () => {
+      await handler.connect("+5511999", defaultOptions);
 
-      // Verify the handler actually registered the connections (not just the mock constructor)
-      expect(() =>
-        handler.sendPresenceUpdate("+5511999", { type: "available" }),
-      ).not.toThrow();
-      expect(() =>
-        handler.sendPresenceUpdate("+5521888", { type: "available" }),
-      ).not.toThrow();
+      expect(handler.connectionActivity("+5511999")).toEqual({
+        inFlightWebhooks: 0,
+        lastTrafficAt: null,
+      });
+      expect(handler.connectionActivity("+5530000")).toBeNull();
     });
   });
 
@@ -248,8 +299,11 @@ describe("BaileysConnectionsHandler", () => {
       );
 
       await handler.connect("+5511999", defaultOptions);
-      // Should create a new connection
+      // Should create a new connection and discard the stale one so its
+      // pending reconnect (e.g. after a connectionReplaced backoff) cannot
+      // resurrect a parallel socket.
       expect(mockConnect).toHaveBeenCalledTimes(1);
+      expect(mockDiscard).toHaveBeenCalledTimes(1);
     });
 
     it("re-throws non-BaileysNotConnectedError errors", async () => {
@@ -279,6 +333,160 @@ describe("BaileysConnectionsHandler", () => {
       expect(() =>
         handler.sendPresenceUpdate("+5511999", { type: "available" }),
       ).toThrow(BaileysNotConnectedError);
+    });
+
+    it("does not spawn a parallel connection when a POST arrives during a boot reconnect", async () => {
+      // Reproduces the race condition where a POST /connections/<phone> arrives
+      // while a boot reconnect (today: the coordinator claim cycle) is mid-flight:
+      // the in-flight connection has already been registered in
+      // `this.connections[id]` but its `connect()` is still awaiting (in
+      // production: useRedisAuthState before makeWASocket), so
+      // `sendPresenceUpdate` throws BaileysNotConnectedError. Without proper
+      // serialization the handler then creates a SECOND parallel connection with
+      // the same identity, producing two sockets that fight on the WhatsApp side
+      // with conflict/replaced in a loop.
+      let resolveSlowConnect: () => void = () => {};
+      const slowConnect = new Promise<void>((res) => {
+        resolveSlowConnect = res;
+      });
+      let connectACompleted = false;
+
+      // First connect() (from the boot reconnect) blocks until released.
+      // Mirrors `await useRedisAuthState()` running before `makeWASocket()`.
+      mockConnect.mockImplementationOnce(async () => {
+        await slowConnect;
+        connectACompleted = true;
+      });
+
+      // sendPresenceUpdate throws only while the socket isn't ready (i.e. the
+      // in-flight connect hasn't completed yet). After it completes, the
+      // socket exists and presence updates succeed.
+      mockSendPresenceUpdate.mockImplementationOnce(async () => {
+        if (!connectACompleted) throw new BaileysNotConnectedError();
+      });
+
+      // Fire the boot reconnect without awaiting — it registers
+      // this.connections[+5511999] and parks on slowConnect.
+      const reconnectPromise = handler.connect("+5511999", {
+        isReconnect: true,
+        webhookUrl: "https://hook.com",
+        webhookVerifyToken: "t",
+      });
+      // Let the reconnect microtasks run so the connection is registered.
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      // Simulate POST /connections/+5511999 from chatwoot mid-flight.
+      // Don't await yet — the fix makes this await the in-flight connect.
+      const connectPromise = handler.connect("+5511999", defaultOptions);
+      // Yield enough times for connect() to reach `await inFlight`.
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      // Unblock the in-flight connect() and let everything finish.
+      resolveSlowConnect();
+      await connectPromise;
+      await reconnectPromise;
+
+      // Exactly one BaileysConnection.connect() must have happened — the in-flight
+      // one. The handler must NOT have created a parallel socket.
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+    });
+
+    it("serializes concurrent connect calls for the same number", async () => {
+      // Two POSTs arriving at the same time for the same number must not produce
+      // two parallel BaileysConnections, since both would auth with the same
+      // identity and the WhatsApp server kicks both with conflict/replaced.
+      let resolveFirstConnect: () => void = () => {};
+      const firstConnect = new Promise<void>((res) => {
+        resolveFirstConnect = res;
+      });
+
+      mockConnect.mockImplementationOnce(async () => {
+        await firstConnect;
+      });
+
+      const first = handler.connect("+5511999", defaultOptions);
+      const second = handler.connect("+5511999", defaultOptions);
+
+      // Let microtasks settle so both callers parked appropriately.
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      resolveFirstConnect();
+      await first;
+      await second;
+
+      // Only one BaileysConnection.connect() call: the second caller reused
+      // the first one via sendPresenceUpdate, not a parallel socket.
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+      expect(mockSendPresenceUpdate).toHaveBeenCalledWith("available");
+    });
+
+    it("re-validates state after BaileysNotConnectedError instead of spawning unconditionally", async () => {
+      // Two concurrent callers can both reach `sendPresenceUpdate` on the same
+      // stale connection, both receive BaileysNotConnectedError, and both
+      // unconditionally call spawnConnection. The second caller must re-check
+      // the in-flight slot after the recovery branch, otherwise we end up with
+      // two parallel replacement sockets — the exact bug the lock is meant to
+      // prevent, just shifted to the recovery path.
+      await handler.connect("+5511999", defaultOptions);
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+
+      let rejectSpu1: (e: unknown) => void = () => {};
+      let rejectSpu2: (e: unknown) => void = () => {};
+      mockSendPresenceUpdate.mockImplementationOnce(
+        () =>
+          new Promise((_, rej) => {
+            rejectSpu1 = rej;
+          }),
+      );
+      mockSendPresenceUpdate.mockImplementationOnce(
+        () =>
+          new Promise((_, rej) => {
+            rejectSpu2 = rej;
+          }),
+      );
+
+      const first = handler.connect("+5511999", defaultOptions);
+      const second = handler.connect("+5511999", defaultOptions);
+
+      // Let both callers park on `await sendPresenceUpdate`.
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      // Both fail at once with the stale-socket error.
+      rejectSpu1(new BaileysNotConnectedError());
+      rejectSpu2(new BaileysNotConnectedError());
+
+      await first;
+      await second;
+
+      // 1 initial + 1 replacement spawn — NOT 3 (initial + 2 parallel replacements).
+      expect(mockConnect).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not let an old connection's onConnectionClose evict a replacement", async () => {
+      // After the inconsistent-state recovery path (BaileysNotConnectedError),
+      // a new connection takes the slot. If the OLD connection later fires
+      // onConnectionClose, it must NOT delete the replacement's entry.
+      await handler.connect("+5511999", defaultOptions);
+      const oldInstance = mockConnectionInstances.get("+5511999");
+
+      mockSendPresenceUpdate.mockRejectedValueOnce(
+        new BaileysNotConnectedError(),
+      );
+      await handler.connect("+5511999", defaultOptions);
+      const newInstance = mockConnectionInstances.get("+5511999");
+      expect(newInstance).not.toBe(oldInstance);
+
+      // Old connection's WS finally closes long after the replacement is live.
+      oldInstance.options.onConnectionClose();
+
+      // Replacement must still be tracked.
+      expect(() =>
+        handler.sendPresenceUpdate("+5511999", { type: "available" }),
+      ).not.toThrow();
     });
   });
 
@@ -481,6 +689,45 @@ describe("BaileysConnectionsHandler", () => {
         BaileysNotConnectedError,
       );
     });
+
+    it("waits for an in-flight connect before logging out", async () => {
+      // A DELETE arriving while a boot reconnect is mid-flight must not
+      // beat the spawn — otherwise the freshly created socket would survive
+      // a logout that thought there was nothing to do, leaving an orphaned
+      // BaileysConnection authenticated with that identity.
+      let resolveSlowConnect: () => void = () => {};
+      mockConnect.mockImplementationOnce(
+        () =>
+          new Promise<void>((res) => {
+            resolveSlowConnect = res;
+          }),
+      );
+
+      const reconnectPromise = handler.connect("+5511999", {
+        isReconnect: true,
+        webhookUrl: "https://h.com",
+        webhookVerifyToken: "t",
+      });
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      const logoutPromise = handler.logout("+5511999");
+      // Yield so logout reaches the in-flight drain.
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      // Logout must not have called the connection's logout yet — the spawn
+      // is still running.
+      expect(mockLogout).not.toHaveBeenCalled();
+
+      resolveSlowConnect();
+      await reconnectPromise;
+      await logoutPromise;
+
+      // After both settle, the logout drove a real WhatsApp logout on the
+      // freshly spawned connection.
+      expect(mockLogout).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("#logoutAll", () => {
@@ -501,6 +748,41 @@ describe("BaileysConnectionsHandler", () => {
     it("handles empty handler gracefully", async () => {
       await handler.logoutAll();
       // Should not throw
+    });
+
+    it("waits for in-flight spawns before iterating connections", async () => {
+      // logoutAll must wait for any connection that is still being spawned
+      // (e.g. by the coordinator claim cycle on boot). Otherwise the new
+      // socket would survive the bulk logout, leaving an orphaned
+      // BaileysConnection authenticated with our identity.
+      let resolveSlowConnect: () => void = () => {};
+      mockConnect.mockImplementationOnce(
+        () =>
+          new Promise<void>((res) => {
+            resolveSlowConnect = res;
+          }),
+      );
+
+      const reconnectPromise = handler.connect("+5511999", {
+        isReconnect: true,
+        webhookUrl: "https://h.com",
+        webhookVerifyToken: "t",
+      });
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      const logoutAllPromise = handler.logoutAll();
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      expect(mockLogout).not.toHaveBeenCalled();
+
+      resolveSlowConnect();
+      await reconnectPromise;
+      await logoutAllPromise;
+
+      // The spawned connection was reaped by logoutAll once the spawn settled.
+      expect(mockLogout).toHaveBeenCalledTimes(1);
     });
   });
 

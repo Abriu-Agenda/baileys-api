@@ -12,17 +12,13 @@ import {
   BaileysConnectionForbiddenError,
   BaileysNotConnectedError,
 } from "@/baileys/connection";
-import {
-  getRedisAuthMetadata,
-  getRedisSavedAuthStateIds,
-} from "@/baileys/redisAuthState";
+import { getRedisAuthMetadata } from "@/baileys/redisAuthState";
 import type {
   BaileysConnectionOptions,
   FetchMessageHistoryOptions,
   MessageKeyWithId,
   SendReceiptsOptions,
 } from "@/baileys/types";
-import { asyncSleep } from "@/helpers/asyncSleep";
 import logger from "@/lib/logger";
 
 type ConnectionFactory = (
@@ -32,6 +28,11 @@ type ConnectionFactory = (
 
 export class BaileysConnectionsHandler {
   private connections: Record<string, BaileysConnection> = {};
+  private inFlightOps: Record<string, Promise<void>> = {};
+  // Discarded connections whose webhook deliveries (including retries) are
+  // still running. They left `connections` already, but the shutdown drain
+  // must keep seeing their in-flight count until it reaches zero.
+  private drainingWebhooks = new Set<BaileysConnection>();
   private createConnection: ConnectionFactory;
 
   constructor(createConnection?: ConnectionFactory) {
@@ -39,79 +40,180 @@ export class BaileysConnectionsHandler {
       createConnection || ((phone, opts) => new BaileysConnection(phone, opts));
   }
 
-  async reconnectFromAuthStore() {
-    const savedConnections =
-      await getRedisSavedAuthStateIds<
-        Omit<BaileysConnectionOptions, "phoneNumber" | "onConnectionClose">
-      >();
+  hasConnection(phoneNumber: string): boolean {
+    return Boolean(this.connections[phoneNumber]);
+  }
 
-    if (savedConnections.length === 0) {
-      logger.info("No saved connections to reconnect");
-      return;
+  getActivePhoneNumbers(): string[] {
+    return Object.keys(this.connections);
+  }
+
+  get size(): number {
+    return Object.keys(this.connections).length;
+  }
+
+  inFlightWebhookCount(): number {
+    for (const connection of this.drainingWebhooks) {
+      if (connection.inFlightWebhooks === 0) {
+        this.drainingWebhooks.delete(connection);
+      }
     }
+    let sum = 0;
+    for (const connection of Object.values(this.connections)) {
+      sum += connection.inFlightWebhooks;
+    }
+    for (const connection of this.drainingWebhooks) {
+      sum += connection.inFlightWebhooks;
+    }
+    return sum;
+  }
 
-    logger.info(
-      "Reconnecting %d connections from auth store %o",
-      savedConnections.length,
-      savedConnections.map(({ id }) => id),
-    );
+  // Activity snapshot used by the coordinator to prefer idle connections
+  // when shedding load (rebalance victim selection, shutdown ordering).
+  connectionActivity(phoneNumber: string): {
+    inFlightWebhooks: number;
+    lastTrafficAt: number | null;
+  } | null {
+    const connection = this.connections[phoneNumber];
+    if (!connection) {
+      return null;
+    }
+    return {
+      inFlightWebhooks: connection.inFlightWebhooks,
+      lastTrafficAt: connection.lastTrafficAt,
+    };
+  }
 
-    const CONCURRENCY = 5;
-    for (let i = 0; i < savedConnections.length; i += CONCURRENCY) {
-      const chunk = savedConnections.slice(i, i + CONCURRENCY);
-      await Promise.allSettled(
-        chunk.map(async ({ id, metadata }) => {
-          await asyncSleep(Math.floor(Math.random() * 100));
-          const connection = this.createConnection(id, {
-            onConnectionClose: () => {
-              delete this.connections[id];
-              logger.debug(
-                "Now tracking %d connections",
-                Object.keys(this.connections).length,
-              );
-            },
-            isReconnect: true,
-            ...metadata,
-          });
-          this.connections[id] = connection;
-          await connection.connect();
-        }),
-      );
+  // Tears down the local socket WITHOUT touching the Redis auth state, so the
+  // identity can be picked up elsewhere. Used by the cluster coordinator for
+  // self-fencing (lease owned by another instance) and graceful handoff.
+  // Serialized through inFlightOps so it cannot interleave with a concurrent
+  // connect/logout for the same number.
+  async discardConnection(phoneNumber: string): Promise<void> {
+    await this.withInFlightOp(phoneNumber, async () => {
+      const connection = this.connections[phoneNumber];
+      if (!connection) {
+        return;
+      }
+      connection.discard();
+      delete this.connections[phoneNumber];
+      if (connection.inFlightWebhooks > 0) {
+        this.drainingWebhooks.add(connection);
+      }
+    });
+  }
+
+  // Drains any in-flight op for `phoneNumber`, reserves a fresh slot
+  // synchronously, and runs `fn` inside it. Serializes concurrent
+  // connect/logout calls for the same number so we never have two parallel
+  // sockets with the same identity (which the WhatsApp server kicks with
+  // conflict/replaced). The internal drain is defense-in-depth so callers
+  // can't accidentally bypass the lock by skipping a prior drain.
+  private async withInFlightOp<T>(
+    phoneNumber: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    // Loop because multiple callers may have been parked on the same slot;
+    // when one resolves, all wake — only the first to assign synchronously
+    // below wins the slot. Single-threaded JS makes this safe: nothing can
+    // run between the while-exit and the synchronous slot assignment.
+    while (this.inFlightOps[phoneNumber]) {
+      await this.inFlightOps[phoneNumber].catch(() => {});
+    }
+    let resolveSlot: () => void = () => {};
+    const slot = new Promise<void>((res) => {
+      resolveSlot = res;
+    });
+    this.inFlightOps[phoneNumber] = slot;
+    try {
+      return await fn();
+    } finally {
+      if (this.inFlightOps[phoneNumber] === slot) {
+        delete this.inFlightOps[phoneNumber];
+      }
+      resolveSlot();
     }
   }
 
+  private async spawnConnection(
+    phoneNumber: string,
+    options: BaileysConnectionOptions,
+  ) {
+    await this.withInFlightOp(phoneNumber, async () => {
+      // If another connection is already registered for this number, discard
+      // it before overwriting. Otherwise its socket would stay alive,
+      // unreachable from `connections` but still racing on our identity.
+      // Guards a re-entrant reconnectFromAuthStore or any future caller
+      // that ends up spawning twice for the same number.
+      const previous = this.connections[phoneNumber];
+      if (previous) {
+        previous.discard();
+      }
+      const connection = this.createConnection(phoneNumber, {
+        ...options,
+        onConnectionClose: () => {
+          // Only clear the slot if it still points at this connection — a
+          // newer connection may have replaced this one (e.g. via the
+          // BaileysNotConnectedError recovery path in `connect`).
+          if (this.connections[phoneNumber] === connection) {
+            delete this.connections[phoneNumber];
+          }
+          logger.debug(
+            "Now tracking %d connections",
+            Object.keys(this.connections).length,
+          );
+          options.onConnectionClose?.();
+        },
+      });
+      this.connections[phoneNumber] = connection;
+      await connection.connect();
+    });
+  }
+
   async connect(phoneNumber: string, options: BaileysConnectionOptions) {
-    if (this.connections[phoneNumber]) {
-      this.connections[phoneNumber].updateOptions(options);
+    // Loops because every decision must be re-validated after an await:
+    //   1. Drain any in-flight connect for this number (multiple callers can
+    //      have parked on the same slot).
+    //   2. If a connection is registered, try to reuse it via
+    //      sendPresenceUpdate. If that throws BaileysNotConnectedError, the
+    //      socket died — evict only if it is still the entry we observed,
+    //      then restart the decision instead of unconditionally spawning a
+    //      replacement (two callers hitting the same stale connection would
+    //      otherwise both spawn parallel sockets with the same identity).
+    //   3. Otherwise spawn a new connection.
+    for (;;) {
+      while (this.inFlightOps[phoneNumber]) {
+        await this.inFlightOps[phoneNumber].catch(() => {});
+      }
+
+      const existing = this.connections[phoneNumber];
+      if (!existing) {
+        await this.spawnConnection(phoneNumber, options);
+        return;
+      }
+
+      await existing.updateOptions(options);
       try {
         // NOTE: This triggers a `connection.update` event.
-        await this.connections[phoneNumber].sendPresenceUpdate("available");
+        await existing.sendPresenceUpdate("available");
         return;
       } catch (error) {
         if (!(error instanceof BaileysNotConnectedError)) {
           throw error;
         }
-        delete this.connections[phoneNumber];
+        if (this.connections[phoneNumber] === existing) {
+          // Discard the stale connection synchronously so any pending
+          // reconnect (e.g. after a connectionReplaced backoff) cannot
+          // resurrect a parallel socket once we spawn the replacement.
+          existing.discard();
+          delete this.connections[phoneNumber];
+        }
         logger.debug(
           "Handled inconsistent connection state for %s",
           phoneNumber,
         );
       }
     }
-
-    const connection = this.createConnection(phoneNumber, {
-      ...options,
-      onConnectionClose: () => {
-        delete this.connections[phoneNumber];
-        options.onConnectionClose?.();
-      },
-    });
-    await connection.connect();
-    this.connections[phoneNumber] = connection;
-    logger.debug(
-      "Now tracking %d connections",
-      Object.keys(this.connections).length,
-    );
   }
 
   async verifyConnectionAccess(phoneNumber: string, apiKeyHash: string | null) {
@@ -225,6 +327,14 @@ export class BaileysConnectionsHandler {
 
   updateProfilePicture(phoneNumber: string, jid: string, image: Buffer) {
     return this.getConnection(phoneNumber).updateProfilePicture(jid, image);
+  }
+
+  getReachoutTimelock(phoneNumber: string) {
+    return this.getConnection(phoneNumber).getReachoutTimelock();
+  }
+
+  getNewChatMessageCap(phoneNumber: string) {
+    return this.getConnection(phoneNumber).getNewChatMessageCap();
   }
 
   onWhatsApp(phoneNumber: string, jids: string[]) {
@@ -366,15 +476,26 @@ export class BaileysConnectionsHandler {
   }
 
   async logout(phoneNumber: string) {
-    await this.getConnection(phoneNumber).logout();
-    delete this.connections[phoneNumber];
-    logger.debug(
-      "Now tracking %d connections",
-      Object.keys(this.connections).length,
-    );
+    // `withInFlightOp` drains any pending connect/logout for the same
+    // number before reserving its slot, so a logout that arrives while
+    // a connect is mid-spawn parks until the spawn settles.
+    await this.withInFlightOp(phoneNumber, async () => {
+      await this.getConnection(phoneNumber).logout();
+      delete this.connections[phoneNumber];
+      logger.debug(
+        "Now tracking %d connections",
+        Object.keys(this.connections).length,
+      );
+    });
   }
 
   async logoutAll() {
+    // Drain in-flight ops in a loop, not a single snapshot — a spawn that
+    // started after our first await would otherwise survive the bulk logout
+    // with a live socket, leaving an orphan authenticated with our identity.
+    while (Object.keys(this.inFlightOps).length > 0) {
+      await Promise.allSettled(Object.values(this.inFlightOps));
+    }
     const connections = Object.values(this.connections);
     await Promise.allSettled(connections.map((c) => c.logout()));
     this.connections = {};

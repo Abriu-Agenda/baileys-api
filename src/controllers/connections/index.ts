@@ -4,6 +4,9 @@ import {
   BaileysConnectionForbiddenError,
   BaileysNotConnectedError,
 } from "@/baileys/connection";
+import coordinator from "@/cluster";
+import { BaileysConnectionOwnedElsewhereError } from "@/cluster/coordinator";
+import { resolveMisdirectedRequest } from "@/cluster/workerRouting";
 import {
   buildEditableMessageContent,
   buildMessageContent,
@@ -32,33 +35,82 @@ const connectionsController = new Elysia({
         description:
           "Forbidden — the API key does not own this connection. Returned when a connection is bound to a different API key.",
       },
+      421: {
+        description:
+          "Misdirected Request — in cluster mode, this instance does not own the connection. The owning instance id is in the x-baileys-owner header; a proxy re-routes the request there. Not returned for POST /connections/{phoneNumber} (explicit takeover).",
+        headers: {
+          "x-baileys-owner": {
+            description: "Instance id of the connection owner",
+            schema: { type: "string" },
+          },
+        },
+      },
     },
   },
 })
   .use(authMiddleware)
-  .onBeforeHandle(async ({ params, apiKeyHash, set }) => {
+  .onBeforeHandle(async ({ params, apiKeyHash, set, request, path }) => {
     const phoneNumber = (params as { phoneNumber?: string })?.phoneNumber;
-    if (phoneNumber) {
-      try {
-        await baileys.verifyConnectionAccess(phoneNumber, apiKeyHash);
-      } catch (e) {
-        if (e instanceof BaileysConnectionForbiddenError) {
-          set.status = 403;
-          return { error: "Forbidden", message: e.message };
-        }
-        throw e;
+    if (!phoneNumber) {
+      return;
+    }
+
+    // Worker role: a request for a phone owned by another live instance is
+    // answered with 421 so the proxy invalidates its route cache and
+    // re-sends to the owner. This runs BEFORE the access check: during a
+    // lease transition the local metadata (apiKeyHash) can lag the new
+    // owner's writes, and answering 403 off that stale copy would mask the
+    // misdirect the proxy knows how to recover from.
+    // POST /connections/:phone is exempt — it is an explicit takeover and
+    // resolves ownership in connectWithLease (409 when the owner is alive).
+    const isConnectTakeover =
+      request.method === "POST" &&
+      decodeURIComponent(path) === `/connections/${phoneNumber}`;
+    if (!isConnectTakeover) {
+      const owner = await resolveMisdirectedRequest(phoneNumber);
+      if (owner) {
+        set.status = 421;
+        set.headers["x-baileys-owner"] = owner;
+        return {
+          error: "Misdirected Request",
+          message: "Connection is owned by another instance",
+        };
       }
+    }
+
+    try {
+      await baileys.verifyConnectionAccess(phoneNumber, apiKeyHash);
+    } catch (e) {
+      if (e instanceof BaileysConnectionForbiddenError) {
+        set.status = 403;
+        return { error: "Forbidden", message: e.message };
+      }
+      throw e;
     }
   })
   .post(
     "/:phoneNumber",
-    async ({ params, body, apiKeyHash }) => {
+    async ({ params, body, apiKeyHash, set }) => {
       const { phoneNumber } = params;
 
-      await baileys.connect(phoneNumber, {
-        ...body,
-        apiKeyHash: apiKeyHash ?? undefined,
-      });
+      // Goes through the coordinator so the connect is backed by a lease:
+      // an explicit POST is authoritative and takes the identity over.
+      try {
+        await coordinator.connectWithLease(phoneNumber, {
+          ...body,
+          apiKeyHash: apiKeyHash ?? undefined,
+        });
+      } catch (e) {
+        if (e instanceof BaileysConnectionOwnedElsewhereError) {
+          set.status = 409;
+          set.headers["x-baileys-owner"] = e.ownerInstanceId;
+          return {
+            error: "Conflict",
+            message: "Connection is owned by another live instance",
+          };
+        }
+        throw e;
+      }
     },
     {
       params: phoneNumberParams,
@@ -112,6 +164,16 @@ const connectionsController = new Elysia({
         responses: {
           200: {
             description: "Connection initiated",
+          },
+          409: {
+            description:
+              "Conflict — in cluster mode, the connection is owned by another live instance (id in the x-baileys-owner header); a proxy re-routes the takeover there instead of stealing a healthy socket.",
+            headers: {
+              "x-baileys-owner": {
+                description: "Instance id of the connection owner",
+                schema: { type: "string" },
+              },
+            },
           },
         },
       },
@@ -197,23 +259,36 @@ const connectionsController = new Elysia({
           ? `@baileys-api:idempotency:send-message:${phoneNumber}:${String(chatwootMessageId)}`
           : null;
 
-      const result = await withIdempotency(idempotencyKey, async () => {
-        const { messageContent: builtContent, quoted } =
-          buildMessageContent(messageContent);
+      let result: Awaited<ReturnType<typeof withIdempotency>>;
+      try {
+        result = await withIdempotency(idempotencyKey, async () => {
+          const { messageContent: builtContent, quoted } =
+            buildMessageContent(messageContent);
 
-        const response = await baileys.sendMessage(phoneNumber, {
-          jid,
-          messageContent: builtContent,
-          quoted,
+          const response = await baileys.sendMessage(phoneNumber, {
+            jid,
+            messageContent: builtContent,
+            quoted,
+          });
+
+          if (!response) return null;
+
+          return {
+            key: response.key,
+            messageTimestamp: response.messageTimestamp,
+          };
         });
-
-        if (!response) return null;
-
-        return {
-          key: response.key,
-          messageTimestamp: response.messageTimestamp,
-        };
-      });
+      } catch (e) {
+        // The phone has no live socket on this instance (never connected, or
+        // dropped mid-request). Surface it as 404 instead of a generic 500 so
+        // callers can distinguish "not connected" from a real send failure.
+        // withIdempotency already released the lock on throw, so a retry after
+        // reconnect is free to proceed.
+        if (e instanceof BaileysNotConnectedError) {
+          return new Response("Phone number not connected", { status: 404 });
+        }
+        throw e;
+      }
 
       if (result.status === "processing") {
         return new Response("Message is already being processed", {
@@ -248,6 +323,9 @@ const connectionsController = new Elysia({
                 }),
               },
             },
+          },
+          404: {
+            description: "Phone number not connected",
           },
           409: {
             description: "Message is already being processed",
@@ -505,6 +583,158 @@ const connectionsController = new Elysia({
             },
           },
           404: { description: "Profile picture not found" },
+        },
+      },
+    },
+  )
+  .get(
+    "/:phoneNumber/reachout-timelock",
+    async ({ params }) => {
+      const { phoneNumber } = params;
+
+      try {
+        const reachoutTimelock = await baileys.getReachoutTimelock(phoneNumber);
+        return { data: reachoutTimelock };
+      } catch (e) {
+        if (e instanceof BaileysNotConnectedError) {
+          return new Response("Phone number not connected", { status: 404 });
+        }
+        throw e;
+      }
+    },
+    {
+      params: phoneNumberParams,
+      detail: {
+        description:
+          "Fetch the account's reach-out time-lock state — the restriction behind error 463 ('account restricted') that blocks starting new chats. Read-only: queries WhatsApp directly (MEX) without sending a message, so it is safe to call on a restricted account.",
+        responses: {
+          200: {
+            description: "Reach-out time-lock state retrieved successfully",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: {
+                      type: "object",
+                      properties: {
+                        isActive: {
+                          type: "boolean",
+                          description:
+                            "Whether the reach-out time-lock is currently enforced",
+                          example: false,
+                        },
+                        timeEnforcementEnds: {
+                          type: "string",
+                          format: "date-time",
+                          nullable: true,
+                          description:
+                            "When the current enforcement window ends",
+                        },
+                        enforcementType: {
+                          type: "string",
+                          description:
+                            "Reason/type of enforcement. 'DEFAULT' means no restriction.",
+                          example: "DEFAULT",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          404: { description: "Phone number not connected" },
+        },
+      },
+    },
+  )
+  .get(
+    "/:phoneNumber/new-chat-cap",
+    async ({ params }) => {
+      const { phoneNumber } = params;
+
+      try {
+        const newChatCap = await baileys.getNewChatMessageCap(phoneNumber);
+        return { data: newChatCap };
+      } catch (e) {
+        if (e instanceof BaileysNotConnectedError) {
+          return new Response("Phone number not connected", { status: 404 });
+        }
+        throw e;
+      }
+    },
+    {
+      params: phoneNumberParams,
+      detail: {
+        description:
+          "Fetch the account's new-chat message cap and usage — an antecedent indicator of the 463 restriction (how many new conversations can still be started this cycle). Read-only: queries WhatsApp directly (MEX) without sending a message.",
+        responses: {
+          200: {
+            description: "New-chat message cap retrieved successfully",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: {
+                      type: "object",
+                      properties: {
+                        total_quota: {
+                          type: "number",
+                          description:
+                            "Total new-chat messages allowed in the current cycle",
+                          example: 100,
+                        },
+                        used_quota: {
+                          type: "number",
+                          description:
+                            "New-chat messages already used in the current cycle",
+                          example: 0,
+                        },
+                        cycle_start_timestamp: {
+                          type: "string",
+                          nullable: true,
+                          description: "Unix timestamp of the cycle start",
+                        },
+                        cycle_end_timestamp: {
+                          type: "string",
+                          nullable: true,
+                          description: "Unix timestamp of the cycle end",
+                        },
+                        server_sent_timestamp: {
+                          type: "string",
+                          nullable: true,
+                          description:
+                            "Unix timestamp when WhatsApp produced this snapshot",
+                        },
+                        ote_status: {
+                          type: "string",
+                          nullable: true,
+                          description:
+                            "One-time-engagement cap status (NOT_ELIGIBLE, ELIGIBLE, ACTIVE_IN_CURRENT_CYCLE, EXHAUSTED)",
+                        },
+                        mv_status: {
+                          type: "string",
+                          nullable: true,
+                          description:
+                            "Multi-vertical cap status (NOT_ELIGIBLE, NOT_ACTIVE, ACTIVE, ACTIVE_UPGRADE_AVAILABLE)",
+                        },
+                        capping_status: {
+                          type: "string",
+                          nullable: true,
+                          description:
+                            "Overall capping status (NONE, FIRST_WARNING, SECOND_WARNING, CAPPED)",
+                          example: "NONE",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          404: { description: "Phone number not connected" },
         },
       },
     },
@@ -1473,7 +1703,7 @@ const connectionsController = new Elysia({
       const { phoneNumber } = params;
 
       try {
-        await baileys.logout(phoneNumber);
+        await coordinator.logoutWithLease(phoneNumber);
       } catch (e) {
         if (e instanceof BaileysNotConnectedError) {
           return new Response("Phone number not found", { status: 404 });
