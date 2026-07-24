@@ -19,6 +19,7 @@ import type {
   MessageKeyWithId,
   SendReceiptsOptions,
 } from "@/baileys/types";
+import { errorToString } from "@/helpers/errorToString";
 import logger from "@/lib/logger";
 
 type ConnectionFactory = (
@@ -164,6 +165,28 @@ export class BaileysConnectionsHandler {
           );
           options.onConnectionClose?.();
         },
+        requestLogout: () => {
+          // Wrong-phone teardown must serialize through inFlightOps so it
+          // can't race a concurrent connect/logout/discard for this number
+          // (issue #313). Mirror onConnectionClose's identity check: a
+          // replacement may already hold the slot, and only the instance that
+          // saw the wrong number should be torn down — logout() clears the
+          // shared auth state, which we must not wipe out from under a live
+          // replacement.
+          void this.withInFlightOp(phoneNumber, async () => {
+            if (this.connections[phoneNumber] !== connection) {
+              return;
+            }
+            await connection.logout();
+            delete this.connections[phoneNumber];
+          }).catch((error) => {
+            logger.error(
+              "[%s] [requestLogout] %s",
+              phoneNumber,
+              errorToString(error),
+            );
+          });
+        },
       });
       this.connections[phoneNumber] = connection;
       await connection.connect();
@@ -181,18 +204,37 @@ export class BaileysConnectionsHandler {
     //      replacement (two callers hitting the same stale connection would
     //      otherwise both spawn parallel sockets with the same identity).
     //   3. Otherwise spawn a new connection.
+    const { forceRestart, ...connectOptions } = options;
     for (;;) {
       while (this.inFlightOps[phoneNumber]) {
         await this.inFlightOps[phoneNumber].catch(() => {});
       }
 
       const existing = this.connections[phoneNumber];
-      if (!existing) {
-        await this.spawnConnection(phoneNumber, options);
+
+      // A just-seeded import/takeover must run on a fresh socket: an existing one
+      // holds stale in-memory creds and would ignore the transplanted session
+      // (e.g. a QR socket keeps emitting QRs). Discard it, then spawn anew.
+      if (existing && forceRestart) {
+        existing.discard();
+        delete this.connections[phoneNumber];
+        // Keep shutdown-drain accounting exactly like discardConnection: a
+        // discarded connection with pending webhook deliveries (e.g. a QR
+        // socket mid-retry) must stay counted so a graceful shutdown waits for
+        // them instead of exiting mid-delivery.
+        if (existing.inFlightWebhooks > 0) {
+          this.drainingWebhooks.add(existing);
+        }
+        await this.spawnConnection(phoneNumber, connectOptions);
         return;
       }
 
-      await existing.updateOptions(options);
+      if (!existing) {
+        await this.spawnConnection(phoneNumber, connectOptions);
+        return;
+      }
+
+      await existing.updateOptions(connectOptions);
       try {
         // NOTE: This triggers a `connection.update` event.
         await existing.sendPresenceUpdate("available");
