@@ -627,8 +627,8 @@ describe("BaileysConnection", () => {
   // an ordinary message and every consumer renders it as unsupported content —
   // while the edit itself is lost.
   describe("encrypted message edits", () => {
-    const CHAT = "167392323834034@lid";
-    const CHAT_PN = "553499503261@s.whatsapp.net";
+    const CHAT = "100000000000001@lid";
+    const CHAT_PN = "553499990001@s.whatsapp.net";
     const ORIG_ID = "3EB078E05D8F792B76A79F";
     const messageSecret = new Uint8Array(32).fill(11);
 
@@ -674,7 +674,7 @@ describe("BaileysConnection", () => {
         id = "edit-1",
         ageSeconds = 0,
         targetKey = {
-          remoteJid: "89572297961476@lid",
+          remoteJid: "20000000000002@lid",
           fromMe: true,
           id: ORIG_ID,
         },
@@ -771,7 +771,7 @@ describe("BaileysConnection", () => {
       await connection.connect();
       mockSocket.user = {
         id: "5511999999999:12@s.whatsapp.net",
-        lid: "89572297961476@lid",
+        lid: "20000000000002@lid",
       };
     }
 
@@ -1432,7 +1432,7 @@ describe("BaileysConnection", () => {
       fetchCalls.length = 0;
 
       const handler = mockEventHandlers.get("messages.upsert")!;
-      const own = "89572297961476@lid";
+      const own = "20000000000002@lid";
       const delivery = handler({
         type: "notify",
         messages: [
@@ -1469,7 +1469,7 @@ describe("BaileysConnection", () => {
     it("derives a fromMe edit's key on a connection that saw nothing before it", async () => {
       await connect();
       // Filed by an earlier connection: the store is all this one inherits.
-      const own = "89572297961476@lid";
+      const own = "20000000000002@lid";
       (redis as any).__hashData.set(
         messageSecretKey("+5511999999999", ORIG_ID),
         new Map([["secret", Buffer.from(messageSecret).toString("base64")]]),
@@ -1733,7 +1733,7 @@ describe("BaileysConnection", () => {
             edit("livre", undefined, {
               id: "edit-2",
               targetKey: {
-                remoteJid: "89572297961476@lid",
+                remoteJid: "20000000000002@lid",
                 fromMe: true,
                 id: OTHER_ID,
               },
@@ -5010,10 +5010,10 @@ describe("BaileysConnection", () => {
         null,
       );
       mockSocket.signalRepository.lidMapping.getLIDForPN.mockResolvedValueOnce(
-        "167392323834034@lid",
+        "100000000000001@lid",
       );
 
-      expect(await fetchFrom("553499503261@lid")).toBe("167392323834034@lid");
+      expect(await fetchFrom("553499990001@lid")).toBe("100000000000001@lid");
     });
 
     it("leaves the address alone when neither direction is known", async () => {
@@ -5021,8 +5021,8 @@ describe("BaileysConnection", () => {
     });
 
     it("does not look up an address that is not a LID", async () => {
-      expect(await fetchFrom("553499503261@s.whatsapp.net")).toBe(
-        "553499503261@s.whatsapp.net",
+      expect(await fetchFrom("553499990001@s.whatsapp.net")).toBe(
+        "553499990001@s.whatsapp.net",
       );
       expect(
         mockSocket.signalRepository.lidMapping.getPNForLID,
@@ -5802,35 +5802,35 @@ describe("BaileysConnection", () => {
 
     it("adds jidAlt when LID is resolved by Baileys signalRepository", async () => {
       mockSocket.signalRepository.lidMapping.getPNForLID.mockResolvedValueOnce(
-        "553499503261@s.whatsapp.net",
+        "553499990001@s.whatsapp.net",
       );
 
       const presenceHandler = mockEventHandlers.get("presence.update")!;
       await presenceHandler({
-        id: "167392323834034@lid",
+        id: "100000000000001@lid",
         presences: {
-          "167392323834034@lid": { lastKnownPresence: "composing" },
+          "100000000000001@lid": { lastKnownPresence: "composing" },
         },
       });
 
       expect(
         mockSocket.signalRepository.lidMapping.getPNForLID,
-      ).toHaveBeenCalledWith("167392323834034@lid");
+      ).toHaveBeenCalledWith("100000000000001@lid");
       const presenceCall = fetchCalls.find((c) => {
         const body = JSON.parse(c.body);
         return body.event === "presence.update";
       });
       expect(presenceCall).toBeDefined();
       const body = JSON.parse(presenceCall!.body);
-      expect(body.data.jidAlt).toBe("553499503261@s.whatsapp.net");
+      expect(body.data.jidAlt).toBe("553499990001@s.whatsapp.net");
     });
 
     it("does not add jidAlt when presence id is not a LID", async () => {
       const presenceHandler = mockEventHandlers.get("presence.update")!;
       await presenceHandler({
-        id: "553499503261@s.whatsapp.net",
+        id: "553499990001@s.whatsapp.net",
         presences: {
-          "553499503261@s.whatsapp.net": { lastKnownPresence: "available" },
+          "553499990001@s.whatsapp.net": { lastKnownPresence: "available" },
         },
       });
 
@@ -5873,9 +5873,9 @@ describe("BaileysConnection", () => {
 
       const presenceHandler = mockEventHandlers.get("presence.update")!;
       await presenceHandler({
-        id: "167392323834034@lid",
+        id: "100000000000001@lid",
         presences: {
-          "167392323834034@lid": { lastKnownPresence: "composing" },
+          "100000000000001@lid": { lastKnownPresence: "composing" },
         },
       });
 
@@ -5886,7 +5886,7 @@ describe("BaileysConnection", () => {
       expect(presenceCall).toBeDefined();
       const body = JSON.parse(presenceCall!.body);
       expect(body.data.jidAlt).toBeUndefined();
-      expect(body.data.id).toBe("167392323834034@lid");
+      expect(body.data.id).toBe("100000000000001@lid");
     });
   });
 
@@ -6103,7 +6103,7 @@ describe("BaileysConnection", () => {
     // A dump strips `groupName` from the messages, so without this every imported group
     // reaches the client under its own jid and stays that way until somebody writes in it.
     describe("what the groups are called", () => {
-      const GROUP = "120363418525571303@g.us";
+      const GROUP = "120363400000000001@g.us";
       const PARTICIPANT = "5511777@s.whatsapp.net";
 
       function groupMessage(id: string) {
