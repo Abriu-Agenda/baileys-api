@@ -416,11 +416,11 @@ describe("what the groups in a dump are called", () => {
     expect(
       groupNames([
         { id: "120363400000000001@g.us", name: "Café Exemplo + fazer.ai" },
-        { id: "120363422502290697@g.us", name: "Obra da casa" },
+        { id: "120363000000000002@g.us", name: "Obra da casa" },
       ]),
     ).toEqual({
       "120363400000000001@g.us": "Café Exemplo + fazer.ai",
-      "120363422502290697@g.us": "Obra da casa",
+      "120363000000000002@g.us": "Obra da casa",
     });
   });
 
@@ -441,7 +441,7 @@ describe("what the groups in a dump are called", () => {
     expect(
       groupNames([
         { id: "120363400000000001@g.us", name: "   " },
-        { id: "120363422502290697@g.us", name: null },
+        { id: "120363000000000002@g.us", name: null },
         { id: "120363424043869415@g.us" },
         { name: "sem jid" },
       ]),
@@ -451,7 +451,7 @@ describe("what the groups in a dump are called", () => {
 
 describe("the names a frame carries", () => {
   const GROUP = "120363400000000001@g.us";
-  const OTHER = "120363422502290697@g.us";
+  const OTHER = "120363000000000002@g.us";
   const named = { [GROUP]: "Obra da casa", [OTHER]: "Outro grupo" };
 
   function groupMessage(id: string, jid: string, body = "hi") {

@@ -6157,7 +6157,7 @@ describe("BaileysConnection", () => {
         await handler({
           chats: [
             { id: GROUP, name: "Obra da casa" },
-            { id: "120363422502290697@g.us", name: "Outro grupo" },
+            { id: "120363000000000002@g.us", name: "Outro grupo" },
           ],
           contacts: [],
           messages: [groupMessage("ID-1")],
